@@ -22,7 +22,8 @@ jobs:
           chmod +x "$CF"
           TC=$(dirname "$(dirname "$(dirname "$CF")")")
           echo "TC=$TC"
-          ls "$TC/lib" | head -30
+          ls "$TC/include/orbis"
+          ls "$TC/lib"
           test -f "$TC/link.x"
           test -d "$TC/include"
           test -d "$TC/lib"
@@ -30,8 +31,6 @@ jobs:
           LD=$(command -v ld.lld)
           echo "CC=$CC"
           echo "LD=$LD"
-          "$CC" --version
-          "$LD" --version
           {
             echo "TC=$TC"
             echo "CF=$CF"
@@ -44,7 +43,7 @@ jobs:
           set -e
           mkdir -p out
           "$CC" -target x86_64-pc-freebsd12-elf -fPIC -funwind-tables -isysroot "$TC" -isystem "$TC/include" -O2 -std=c++17 -fno-exceptions -fno-rtti -D__PS4__ -Wno-unused -c src/main.cpp -o out/main.o
-          "$LD" out/main.o -m elf_x86_64 -pie --script "$TC/link.x" --eh-frame-hdr -L"$TC/lib" -Wl,--gc-sections -Wl,-z,max-page-size=16384 -lSceLibKernel_stub -lScePad_stub -lSceSysUtil_stub -lSceUserService_stub -lSceVideoOut_stub -lc -lkernel -lm -o 27menu.elf
+          "$LD" out/main.o -m elf_x86_64 -pie --script "$TC/link.x" --eh-frame-hdr -L"$TC/lib" -Wl,--gc-sections -Wl,-z,max-page-size=16384 -lSceLibKernel_stub -lc -lkernel -lm -o 27menu.elf
           "$CF" --lib -in=27menu.elf -out=27menu.sprx
           ls -la 27menu.sprx
 
