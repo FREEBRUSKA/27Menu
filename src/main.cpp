@@ -1,6 +1,4 @@
 #include <orbis/libkernel.h>
-#include <orbis/libpad.h>
-#include <orbis/UserService.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +24,40 @@ static void notify(const char* f, ...) {
     char b[256]; va_list a; va_start(a, f); vsnprintf(b, sizeof b, f, a); va_end(a);
     if (g_notify) g_notify(0x11, b);
     klog(b);
+}
+
+// ================= API DI SISTEMA (risolte a runtime) =================
+#define BTN_L3     0x0002
+#define BTN_R3     0x0004
+#define BTN_UP     0x0010
+#define BTN_RIGHT  0x0020
+#define BTN_DOWN   0x0040
+#define BTN_LEFT   0x0080
+#define BTN_L2     0x0100
+#define BTN_R2     0x0200
+#define BTN_CIRCLE 0x2000
+#define BTN_CROSS  0x4000
+#define BTN_TOUCH  0x100000
+#define PAD_STD    0
+
+struct PadData { uint32_t buttons; uint8_t rest[124]; };
+
+typedef int (*FnPadInit)(void);
+typedef int (*FnPadOpen)(int, int, int, void*);
+typedef int (*FnPadRead)(int, void*);
+typedef int (*FnPadClose)(int);
+typedef int (*FnFgUser)(int*);
+
+static FnPadInit  pPadInit;
+static FnPadOpen  pPadOpen;
+static FnPadRead  pPadRead;
+static FnPadClose pPadClose;
+static FnFgUser   pFgUser;
+
+static uint64_t sym(int h, const char* n) {
+    void* p = 0;
+    if (sceKernelDlsym(h, n, &p) != 0) return 0;
+    return (uint64_t)p;
 }
 
 // ================= FONT 5x7 (ASCII 0x20-0x5F) =================
@@ -256,11 +288,11 @@ static int h_Flip(int h, int idx, int mode, int64_t arg) {
 static int ovInit() {
     int m = sceKernelLoadStartModule("libSceVideoOut.sprx", 0, 0, 0, 0, 0);
     if (m <= 0) { klog("[27] load videoout %d", m); return 0; }
-    void *a = 0, *b = 0;
-    if (sceKernelDlsym(m, "sceVideoOutSubmitFlip", &a) != 0) { klog("[27] dlsym flip"); return 0; }
-    if (sceKernelDlsym(m, "sceVideoOutRegisterBuffers", &b) != 0) { klog("[27] dlsym reg"); return 0; }
-    int r1 = hookInstall((uint64_t)a, (void*)h_Flip, (void**)&o_Flip);
-    int r2 = hookInstall((uint64_t)b, (void*)h_Reg, (void**)&o_Reg);
+    uint64_t a = sym(m, "sceVideoOutSubmitFlip");
+    uint64_t b = sym(m, "sceVideoOutRegisterBuffers");
+    if (!a || !b) { klog("[27] dlsym videoout"); return 0; }
+    int r1 = hookInstall(a, (void*)h_Flip, (void**)&o_Flip);
+    int r2 = hookInstall(b, (void*)h_Reg, (void**)&o_Reg);
     return r1 && r2;
 }
 
@@ -464,45 +496,46 @@ static volatile int g_alive;
 static uint64_t g_lastTap;
 
 static void* inputLoop(void*) {
-    int pad = -1, uid = 0;
+    int pad = -1;
     uint32_t prev = 0;
     while (g_alive) {
         if (pad < 0) {
-            if (sceUserServiceGetForegroundUser(&uid) == 0)
-                pad = scePadOpen(uid, ORBIS_PAD_PORT_TYPE_STANDARD, 0, 0);
+            int uid = 0x10000000;
+            if (pFgUser) { int u = 0; if (pFgUser(&u) == 0) uid = u; }
+            if (pPadOpen) pad = pPadOpen(uid, PAD_STD, 0, 0);
             sceKernelUsleep(400000);
             continue;
         }
-        OrbisPadData d; memset(&d, 0, sizeof d);
-        if (scePadReadState(pad, &d) != 0) { scePadClose(pad); pad = -1; continue; }
+        PadData d; memset(&d, 0, sizeof d);
+        if (pPadRead(pad, &d) != 0) { if (pPadClose) pPadClose(pad); pad = -1; continue; }
         uint32_t pr = d.buttons & ~prev;
         prev = d.buttons;
 
-        if (pr & ORBIS_PAD_BUTTON_TOUCH_PAD) {
+        if (pr & BTN_TOUCH) {
             uint64_t now = sceKernelGetProcessTime();
             if (now - g_lastTap < (uint64_t)DBL_MS * 1000) { g_open = !g_open; g_sel = 0; g_lastTap = 0; }
             else g_lastTap = now;
         }
 
         if (g_open) {
-            if (pr & ORBIS_PAD_BUTTON_UP) g_sel = (g_sel + NITEMS - 1) % NITEMS;
-            if (pr & ORBIS_PAD_BUTTON_DOWN) g_sel = (g_sel + 1) % NITEMS;
-            if (pr & ORBIS_PAD_BUTTON_LEFT) {
+            if (pr & BTN_UP) g_sel = (g_sel + NITEMS - 1) % NITEMS;
+            if (pr & BTN_DOWN) g_sel = (g_sel + 1) % NITEMS;
+            if (pr & BTN_LEFT) {
                 Item& it = ITEMS[g_sel];
                 if (it.type == T_INT) *it.i = (*it.i - it.st > it.lo) ? *it.i - it.st : it.lo;
             }
-            if (pr & ORBIS_PAD_BUTTON_RIGHT) {
+            if (pr & BTN_RIGHT) {
                 Item& it = ITEMS[g_sel];
                 if (it.type == T_INT) *it.i = (*it.i + it.st < it.hi) ? *it.i + it.st : it.hi;
             }
-            if (pr & ORBIS_PAD_BUTTON_CROSS) {
+            if (pr & BTN_CROSS) {
                 Item& it = ITEMS[g_sel];
                 if (it.type == T_BOOL) *it.b = !*it.b;
             }
-            if (pr & ORBIS_PAD_BUTTON_CIRCLE) g_open = 0;
+            if (pr & BTN_CIRCLE) g_open = 0;
         } else {
-            if (d.buttons & ORBIS_PAD_BUTTON_R2) r6Silent();
-            if (d.buttons & ORBIS_PAD_BUTTON_L2) {
+            if (d.buttons & BTN_R2) r6Silent();
+            if (d.buttons & BTN_L2) {
                 r6Aim();
                 if (g_cfg.norecoil && g_count && OF_CAMERA) {
                     uint64_t cam = *(uint64_t*)g_cam;
@@ -512,21 +545,30 @@ static void* inputLoop(void*) {
         }
         sceKernelUsleep(POLL_MS * 1000);
     }
-    if (pad >= 0) scePadClose(pad);
+    if (pad >= 0 && pPadClose) pPadClose(pad);
     return 0;
 }
 
 // ================= MAIN =================
 __attribute__((visibility("default"))) int _init(void) {
-    OrbisUserServiceInitializeParams up; memset(&up, 0, sizeof up);
-    up.priority = ORBIS_KERNEL_PRIO_FIFO_DEFAULT;
-    sceUserServiceInitialize(&up);
-
     int su = sceKernelLoadStartModule("libSceSysUtil.sprx", 0, 0, 0, 0, 0);
     if (su > 0) {
-        void* np = 0;
-        if (sceKernelDlsym(su, "sceSysUtilSendSystemNotificationWithText", &np) == 0) g_notify = (NotifyFn)np;
+        uint64_t np = sym(su, "sceSysUtilSendSystemNotificationWithText");
+        if (np) g_notify = (NotifyFn)np;
     }
+
+    int pm = sceKernelLoadStartModule("libScePad.sprx", 0, 0, 0, 0, 0);
+    if (pm > 0) {
+        pPadInit  = (FnPadInit)sym(pm, "scePadInit");
+        pPadOpen  = (FnPadOpen)sym(pm, "scePadOpen");
+        pPadRead  = (FnPadRead)sym(pm, "scePadReadState");
+        pPadClose = (FnPadClose)sym(pm, "scePadClose");
+        if (pPadInit) pPadInit();
+    }
+    if (!pPadOpen || !pPadRead) { notify(MM_NAME ": PAD FALLITO"); return 0; }
+
+    int um = sceKernelLoadStartModule("libSceUserService.sprx", 0, 0, 0, 0, 0);
+    if (um > 0) pFgUser = (FnFgUser)sym(um, "sceUserServiceGetForegroundUser");
 
     if (!r6Resolve()) { notify(MM_NAME ": EBOOT NON TROVATO"); return 0; }
     if (!ovInit()) { notify(MM_NAME ": VIDEO OUT FALLITO"); return 0; }
