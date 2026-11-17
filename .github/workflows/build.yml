@@ -19,11 +19,6 @@ jobs:
           tar xzf tc.tar.gz -C "$HOME/tc" --strip-components=1
           echo "OO_PS4_TOOLCHAIN=$HOME/tc" >> $GITHUB_ENV
 
-      - name: libDBG
-        run: |
-          git clone --depth 1 https://github.com/LightningMods/libdbg.git external/libdbg
-          make -C external/libdbg -j4 || make -C external/libdbg
-
       - name: Sorgenti
         run: |
           mkdir -p src
@@ -34,9 +29,9 @@ jobs:
           CXX       := $(TOOLCHAIN)/bin/clang++
           LD        := $(TOOLCHAIN)/bin/ld.lld
           CREATE    := $(TOOLCHAIN)/bin/create-fself
-          CXXFLAGS  := -target x86_64-pc-freebsd12-elf -fPIC -funwind-tables -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include -Iexternal/libdbg/include -O2 -std=c++17 -fno-exceptions -fno-rtti -D__PS4__ -Wall
-          LDFLAGS   := -m elf_x86_64 -pie --script $(TOOLCHAIN)/share/linker.map --eh-frame-hdr -L$(TOOLCHAIN)/lib -Lexternal/libdbg/lib -Wl,--gc-sections -Wl,-z,max-page-size=16384
-          LIBS      := -lSceLibKernel_stub -lScePad_stub -lSceSysUtil_stub -lSceUserService_stub -lSceVideoOut_stub -ldbg -lc -lkernel
+          CXXFLAGS  := -target x86_64-pc-freebsd12-elf -fPIC -funwind-tables -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include -O2 -std=c++17 -fno-exceptions -fno-rtti -D__PS4__ -Wall
+          LDFLAGS   := -m elf_x86_64 -pie --script $(TOOLCHAIN)/share/linker.map --eh-frame-hdr -L$(TOOLCHAIN)/lib -Wl,--gc-sections -Wl,-z,max-page-size=16384
+          LIBS      := -lSceLibKernel_stub -lScePad_stub -lSceSysUtil_stub -lSceUserService_stub -lSceVideoOut_stub -lc -lkernel -lm
 
           all: $(TARGET).sprx
 
@@ -57,7 +52,6 @@ jobs:
           #include <orbis/libsysutil.h>
           #include <orbis/libpad.h>
           #include <orbis/UserService.h>
-          #include <dbg.h>
           #include <stdarg.h>
           #include <stdio.h>
           #include <string.h>
@@ -144,9 +138,95 @@ jobs:
               return 0;
           }
 
-          // ================= HOOKS =================
-          static int hookInstall(uint64_t t, void* f, void** o) { return t && dbg::hook((void*)t, f, o); }
-          static int memPatch(uint64_t a, const void* d, size_t n) { return a && dbg::patch((void*)a, d, n); }
+          // ================= HOOK ENGINE =================
+          static int insnLen(const unsigned char* p) {
+              int i = 0;
+              for (;;) {
+                  unsigned char b = p[i];
+                  if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+                      b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65) { i++; continue; }
+                  if (b >= 0x40 && b <= 0x4F) { i++; continue; }
+                  break;
+              }
+              unsigned char op = p[i++];
+              if (op == 0x0F) {
+                  unsigned char o2 = p[i++];
+                  if (o2 == 0x38 || o2 == 0x3A) i++;
+              }
+              int modrm = 1, imm = 0;
+              if (op >= 0x50 && op <= 0x5F) modrm = 0;
+              else if (op == 0x90 || op == 0xC3 || op == 0xC9 || op == 0xCC || op == 0x98 || op == 0x99) modrm = 0;
+              else if (op == 0xE8 || op == 0xE9) { modrm = 0; imm = 4; }
+              else if (op == 0xEB || op == 0x6A) { modrm = 0; imm = 1; }
+              else if (op == 0x68) { modrm = 0; imm = 4; }
+              else if (op >= 0xB0 && op <= 0xB7) { modrm = 0; imm = 1; }
+              else if (op >= 0xB8 && op <= 0xBF) { modrm = 0; imm = 4; }
+              if (modrm) {
+                  unsigned char m = p[i++];
+                  int mod = m >> 6, rm = m & 7;
+                  if (mod != 3) {
+                      if (rm == 4) {
+                          unsigned char sib = p[i++];
+                          if (mod == 0 && (sib & 7) == 5) imm += 4;
+                      }
+                      if (mod == 0 && rm == 5) imm += 4;
+                      else if (mod == 1) imm += 1;
+                      else if (mod == 2) imm += 4;
+                  }
+                  if (op == 0x80 || op == 0x83) imm += 1;
+                  else if (op == 0x81) imm += 4;
+                  else if (op == 0xC6) imm += 1;
+                  else if (op == 0xC7) imm += 4;
+              }
+              return i + imm;
+          }
+
+          struct HK { uint64_t addr; unsigned char b[16]; int len; };
+          static HK g_hk[8];
+          static int g_hkn;
+
+          static int memPatch(uint64_t a, const void* d, size_t n) {
+              if (!a || !d || !n) return 0;
+              uintptr_t s = a & ~0xFFFULL, e = (a + n + 0xFFF) & ~0xFFFULL;
+              sceKernelMprotect((void*)s, e - s, 7);
+              memcpy((void*)a, d, n);
+              return 1;
+          }
+
+          static int hookInstall(uint64_t t, void* fn, void** orig) {
+              if (!t) return 0;
+              unsigned char* p = (unsigned char*)t;
+              int len = 0;
+              while (len < 5 && len < 16) {
+                  int l = insnLen(p + len);
+                  if (l <= 0) return 0;
+                  len += l;
+              }
+              void* tr = 0;
+              if (sceKernelMmap(0, 0x1000, 7, 0x1002, -1, 0, &tr) != 0 || !tr) {
+                  klog("[27] mmap trampoline fallito");
+                  return 0;
+              }
+              unsigned char* tp = (unsigned char*)tr;
+              memcpy(tp, p, len);
+              tp[len] = 0xE9;
+              *(int32_t*)(tp + len + 1) = (int32_t)((uint64_t)(p + len) - (uint64_t)(tp + len + 5));
+
+              if (g_hkn < 8) {
+                  g_hk[g_hkn].addr = t;
+                  g_hk[g_hkn].len = len;
+                  memcpy(g_hk[g_hkn].b, p, len);
+                  g_hkn++;
+              }
+              uintptr_t pg = t & ~0xFFFULL;
+              sceKernelMprotect((void*)pg, 0x1000, 7);
+              p[0] = 0xE9;
+              *(int32_t*)(p + 1) = (int32_t)((uint64_t)fn - (uint64_t)(p + 5));
+              for (int i = 5; i < len; i++) p[i] = 0x90;
+              if (orig) *orig = tr;
+              klog("[27] hook %llx len %d", t, len);
+              return 1;
+          }
 
           // ================= OVERLAY =================
           #define C_BG    0xE6000000u
@@ -172,11 +252,10 @@ jobs:
               uint32_t a = c >> 24;
               if (a == 255) { *p = c; return; }
               uint32_t d = *p;
-              uint32_t r = (((c & 0xFF) * a + (d & 0xFF) * (255 - a)) / 255)
-                         | (((((c >> 8) & 0xFF) * a + ((d >> 8) & 0xFF) * (255 - a)) / 255) << 8)
-                         | (((((c >> 16) & 0xFF) * a + ((d >> 16) & 0xFF) * (255 - a)) / 255) << 16)
-                         | 0xFF000000;
-              *p = r;
+              *p = (((c & 0xFF) * a + (d & 0xFF) * (255 - a)) / 255)
+                 | (((((c >> 8) & 0xFF) * a + ((d >> 8) & 0xFF) * (255 - a)) / 255) << 8)
+                 | (((((c >> 16) & 0xFF) * a + ((d >> 16) & 0xFF) * (255 - a)) / 255) << 16)
+                 | 0xFF000000;
           }
 
           static void ovRect(int x, int y, int w, int h, uint32_t c) {
@@ -237,10 +316,11 @@ jobs:
               int m = sceKernelLoadStartModule("libSceVideoOut.sprx", 0, 0, 0, 0, 0);
               if (m <= 0) { klog("[27] load videoout %d", m); return 0; }
               void *a = 0, *b = 0;
-              if (sceKernelDlsym(m, "sceVideoOutSubmitFlip", &a) != 0) return 0;
-              if (sceKernelDlsym(m, "sceVideoOutRegisterBuffers", &b) != 0) return 0;
-              return hookInstall((uint64_t)a, (void*)h_Flip, (void**)&o_Flip)
-                  && hookInstall((uint64_t)b, (void*)h_Reg, (void**)&o_Reg);
+              if (sceKernelDlsym(m, "sceVideoOutSubmitFlip", &a) != 0) { klog("[27] dlsym flip"); return 0; }
+              if (sceKernelDlsym(m, "sceVideoOutRegisterBuffers", &b) != 0) { klog("[27] dlsym reg"); return 0; }
+              int r1 = hookInstall((uint64_t)a, (void*)h_Flip, (void**)&o_Flip);
+              int r2 = hookInstall((uint64_t)b, (void*)h_Reg, (void**)&o_Reg);
+              return r1 && r2;
           }
 
           // ================= OFFSET R6S (DA AGGIORNARE) =================
@@ -288,6 +368,7 @@ jobs:
               g_gm = a ? a - 4 : g_base + OF_GAMEMANAGER;
               g_list = b ? b - 4 : g_base + OF_ENTITYLIST;
               g_cam = g_base + OF_CAMERA;
+              klog("[27] base %llx", g_base);
               return 1;
           }
 
@@ -387,14 +468,14 @@ jobs:
           enum { T_BOOL, T_INT };
           struct Item { const char* label; int type; int* b; int* i; int lo, hi, st; };
           static Item ITEMS[] = {
-              { "AIMBOT",        T_BOOL, &g_cfg.aimbot,   0,          0,  0,  0 },
-              { "AIMBOT FOV",    T_INT,  0,               &g_cfg.aimFov,  1, 30, 1 },
-              { "AIMBOT SMOOTH", T_INT,  0,               &g_cfg.smooth,  1, 20, 1 },
-              { "SILENT AIM",    T_BOOL, &g_cfg.silent,   0,          0,  0,  0 },
-              { "SILENT FOV",    T_INT,  0,               &g_cfg.silFov,  1, 30, 1 },
-              { "SKELETON ESP",  T_BOOL, &g_cfg.esp,      0,          0,  0,  0 },
-              { "ESP DIST",      T_INT,  0,               &g_cfg.espDist, 0, 250, 10 },
-              { "NO RECOIL",     T_BOOL, &g_cfg.norecoil, 0,          0,  0,  0 },
+              { "AIMBOT",        T_BOOL, &g_cfg.aimbot,   0,             0,   0,  0 },
+              { "AIMBOT FOV",    T_INT,  0,               &g_cfg.aimFov, 1,  30,  1 },
+              { "AIMBOT SMOOTH", T_INT,  0,               &g_cfg.smooth, 1,  20,  1 },
+              { "SILENT AIM",    T_BOOL, &g_cfg.silent,   0,             0,   0,  0 },
+              { "SILENT FOV",    T_INT,  0,               &g_cfg.silFov, 1,  30,  1 },
+              { "SKELETON ESP",  T_BOOL, &g_cfg.esp,      0,             0,   0,  0 },
+              { "ESP DIST",      T_INT,  0,               &g_cfg.espDist,0, 250, 10 },
+              { "NO RECOIL",     T_BOOL, &g_cfg.norecoil, 0,             0,   0,  0 },
           };
           static const int NITEMS = 8;
           static int g_open, g_sel;
@@ -421,4 +502,108 @@ jobs:
                   char r[8];
                   if (it.type == T_BOOL) snprintf(r, sizeof r, "%s", *it.b ? "ON" : "OFF");
                   else snprintf(r, sizeof r, "%d", *it.i);
-                  ovT
+                  ovText(x + W - PAD - ovTextW(r, 1), cy + 5, r, C_WHITE, 1);
+              }
+              ovLine(x, y + H - 24, x + W, y + H - 24, C_RED);
+              ovText(x + PAD, y + H - 18, "X SELEZIONA  O CHIUDI", C_DRED, 1);
+          }
+
+          void frameRender() {
+              int sw = (int)g_cw, sh = (int)g_ch;
+              r6Update();
+              r6Esp(sw, sh);
+              if (g_open) menuDraw(sw, sh);
+          }
+
+          // ================= INPUT =================
+          static volatile int g_alive;
+          static uint64_t g_lastTap;
+
+          static void* inputLoop(void*) {
+              int pad = -1, uid = 0;
+              uint32_t prev = 0;
+              while (g_alive) {
+                  if (pad < 0) {
+                      if (sceUserServiceGetForegroundUser(&uid) == 0) {
+                          OrbisPadOpenParam op; memset(&op, 0, sizeof op);
+                          pad = scePadOpen(uid, ORBIS_PAD_PORT_TYPE_STANDARD, 0, &op);
+                      }
+                      sceKernelUsleep(400000);
+                      continue;
+                  }
+                  OrbisPadData d; memset(&d, 0, sizeof d);
+                  if (scePadReadState(pad, &d) != 0) { scePadClose(pad); pad = -1; continue; }
+                  uint32_t pr = d.buttons & ~prev;
+                  prev = d.buttons;
+
+                  if (pr & ORBIS_PAD_BUTTON_TOUCH_PAD) {
+                      uint64_t now = sceKernelGetProcessTime();
+                      if (now - g_lastTap < (uint64_t)DBL_MS * 1000) { g_open = !g_open; g_sel = 0; g_lastTap = 0; }
+                      else g_lastTap = now;
+                  }
+
+                  if (g_open) {
+                      if (pr & ORBIS_PAD_BUTTON_UP) g_sel = (g_sel + NITEMS - 1) % NITEMS;
+                      if (pr & ORBIS_PAD_BUTTON_DOWN) g_sel = (g_sel + 1) % NITEMS;
+                      if (pr & ORBIS_PAD_BUTTON_LEFT) {
+                          Item& it = ITEMS[g_sel];
+                          if (it.type == T_INT) *it.i = (*it.i - it.st > it.lo) ? *it.i - it.st : it.lo;
+                      }
+                      if (pr & ORBIS_PAD_BUTTON_RIGHT) {
+                          Item& it = ITEMS[g_sel];
+                          if (it.type == T_INT) *it.i = (*it.i + it.st < it.hi) ? *it.i + it.st : it.hi;
+                      }
+                      if (pr & ORBIS_PAD_BUTTON_CROSS) {
+                          Item& it = ITEMS[g_sel];
+                          if (it.type == T_BOOL) *it.b = !*it.b;
+                      }
+                      if (pr & ORBIS_PAD_BUTTON_CIRCLE) g_open = 0;
+                  } else {
+                      if (d.buttons & ORBIS_PAD_BUTTON_R2) r6Silent();
+                      if (d.buttons & ORBIS_PAD_BUTTON_L2) {
+                          r6Aim();
+                          if (g_cfg.norecoil) {
+                              uint64_t cam = *(uint64_t*)g_cam;
+                              if (cam) *(float*)(cam + OF_CAM_PITCH) -= 0.35f;
+                          }
+                      }
+                  }
+                  sceKernelUsleep(POLL_MS * 1000);
+              }
+              if (pad >= 0) scePadClose(pad);
+              return 0;
+          }
+
+          // ================= MAIN =================
+          __attribute__((visibility("default"))) int _init(void) {
+              OrbisUserServiceInitializeParams up; memset(&up, 0, sizeof up);
+              up.priority = ORBIS_KERNEL_PRIO_FIFO_DEFAULT;
+              sceUserServiceInitialize(&up);
+
+              if (!r6Resolve()) { notify(MM_NAME ": EBOOT NON TROVATO"); return 0; }
+              if (!ovInit()) { notify(MM_NAME ": VIDEO OUT FALLITO"); return 0; }
+
+              g_alive = 1;
+              OrbisPthread th;
+              OrbisPthreadParam ap; memset(&ap, 0, sizeof ap);
+              ap.stackSize = 0x10000;
+              ap.priority = ORBIS_KERNEL_PRIO_FIFO_DEFAULT;
+              OrbisPthreadCreate(&th, &ap, inputLoop, 0);
+
+              notify(MM_NAME " " MM_VER " PRONTO - DOPPIO TAP TOUCHPAD");
+              return 0;
+          }
+
+          __attribute__((visibility("default"))) void _fini(void) {
+              g_alive = 0;
+              sceKernelUsleep(200000);
+          }
+          EOF
+
+      - name: Build
+        run: make -j4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 27menu-sprx
+          path: "*.sprx"
