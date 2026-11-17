@@ -14,10 +14,18 @@ jobs:
           set -e
           curl -fL --retry 3 -o tc.tar.gz https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
           mkdir -p "$HOME/tc"
-          tar xzf tc.tar.gz -C "$HOME/tc" --strip-components=2
-          test -x "$HOME/tc/bin/clang++"
-          test -x "$HOME/tc/bin/create-fself"
-          echo "OO_PS4_TOOLCHAIN=$HOME/tc" >> $GITHUB_ENV
+          tar xzf tc.tar.gz -C "$HOME/tc"
+          TC=$(dirname "$(dirname "$(find "$HOME/tc" -name 'clang++' | head -1)")")
+          CF=$(find "$HOME/tc" -name 'create-fself' | head -1)
+          echo "TC=$TC"
+          echo "CF=$CF"
+          ls "$TC"
+          ls "$TC/share"
+          test -x "$TC/bin/clang++"
+          test -n "$CF"
+          test -f "$TC/share/linker.map"
+          echo "OO_PS4_TOOLCHAIN=$TC" >> $GITHUB_ENV
+          echo "CREATE_FSELF=$CF" >> $GITHUB_ENV
 
       - name: Build
         run: |
@@ -26,7 +34,7 @@ jobs:
           mkdir -p out
           "$TC/bin/clang++" -target x86_64-pc-freebsd12-elf -fPIC -funwind-tables -isysroot "$TC" -isystem "$TC/include" -O2 -std=c++17 -fno-exceptions -fno-rtti -D__PS4__ -Wno-unused -c src/main.cpp -o out/main.o
           "$TC/bin/ld.lld" out/main.o -m elf_x86_64 -pie --script "$TC/share/linker.map" --eh-frame-hdr -L"$TC/lib" -Wl,--gc-sections -Wl,-z,max-page-size=16384 -lSceLibKernel_stub -lScePad_stub -lSceSysUtil_stub -lSceUserService_stub -lSceVideoOut_stub -lc -lkernel -lm -o 27menu.elf
-          "$TC/bin/create-fself" --lib -in=27menu.elf -out=27menu.sprx
+          "$CREATE_FSELF" --lib -in=27menu.elf -out=27menu.sprx
           ls -la 27menu.sprx
 
       - uses: actions/upload-artifact@v4
