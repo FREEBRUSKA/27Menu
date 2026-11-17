@@ -1,5 +1,4 @@
 #include <orbis/libkernel.h>
-#include <orbis/libsysutil.h>
 #include <orbis/libpad.h>
 #include <orbis/UserService.h>
 #include <stdarg.h>
@@ -19,9 +18,14 @@ static void klog(const char* f, ...) {
     char b[256]; va_list a; va_start(a, f); vsnprintf(b, sizeof b, f, a); va_end(a);
     sceKernelDebugOutText(0, b);
 }
+
+typedef int (*NotifyFn)(unsigned int, const char*);
+static NotifyFn g_notify;
+
 static void notify(const char* f, ...) {
     char b[256]; va_list a; va_start(a, f); vsnprintf(b, sizeof b, f, a); va_end(a);
-    sceSysUtilSendSystemNotificationWithText(0x11, b);
+    if (g_notify) g_notify(0x11, b);
+    klog(b);
 }
 
 // ================= FONT 5x7 (ASCII 0x20-0x5F) =================
@@ -517,6 +521,12 @@ __attribute__((visibility("default"))) int _init(void) {
     OrbisUserServiceInitializeParams up; memset(&up, 0, sizeof up);
     up.priority = ORBIS_KERNEL_PRIO_FIFO_DEFAULT;
     sceUserServiceInitialize(&up);
+
+    int su = sceKernelLoadStartModule("libSceSysUtil.sprx", 0, 0, 0, 0, 0);
+    if (su > 0) {
+        void* np = 0;
+        if (sceKernelDlsym(su, "sceSysUtilSendSystemNotificationWithText", &np) == 0) g_notify = (NotifyFn)np;
+    }
 
     if (!r6Resolve()) { notify(MM_NAME ": EBOOT NON TROVATO"); return 0; }
     if (!ovInit()) { notify(MM_NAME ": VIDEO OUT FALLITO"); return 0; }
