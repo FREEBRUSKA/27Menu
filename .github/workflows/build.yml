@@ -352,16 +352,20 @@ jobs:
               g_gm = a ? a - 4 : g_base + OF_GAMEMANAGER;
               g_list = b ? b - 4 : g_base + OF_ENTITYLIST;
               g_cam = g_base + OF_CAMERA;
+              klog("[27] base pronto");
               return 1;
           }
 
           static uint64_t localPawn() {
+              if (!OF_LOCALPLAYER) return 0;
               uint64_t lp = *(uint64_t*)(g_base + OF_LOCALPLAYER);
-              return lp ? *(uint64_t*)(lp + OF_ENT_PAWN) : 0;
+              if (!lp) return 0;
+              return *(uint64_t*)(lp + OF_ENT_PAWN);
           }
 
           static void r6Update() {
               g_count = 0;
+              if (!OF_LOCALPLAYER || !OF_CAMERA || !OF_VIEWMATRIX) return;
               uint64_t vm = g_base + OF_VIEWMATRIX;
               for (int i = 0; i < 16; i++) g_vm[i] = *(float*)(vm + i * 4);
               uint64_t list = g_list ? *(uint64_t*)g_list : 0;
@@ -402,7 +406,7 @@ jobs:
           }
 
           static void r6Aim() {
-              if (!g_cfg.aimbot || !g_count) return;
+              if (!g_cfg.aimbot || !g_count || !OF_CAMERA) return;
               uint64_t cam = *(uint64_t*)g_cam;
               if (!cam) return;
               float sx, sy;
@@ -415,7 +419,7 @@ jobs:
           }
 
           static void r6Silent() {
-              if (!g_cfg.silent) return;
+              if (!g_cfg.silent || !g_count || !OF_CAMERA) return;
               uint64_t cam = *(uint64_t*)g_cam;
               if (!cam) return;
               float sx, sy;
@@ -431,8 +435,4 @@ jobs:
                   {4,10},{10,11},{11,12},{4,13},{13,14},{14,15}
               };
               for (int i = 0; i < g_count; i++) {
-                  if (g_cfg.espDist > 0 && g_pl[i].dist > (float)g_cfg.espDist) continue;
-                  float px[BONES], py[BONES]; int ok[BONES];
-                  for (int b = 0; b < BONES; b++)
-                      ok[b] = w2s(g_pl[i].bones[b], &px[b], &py[b], sw, sh);
-  
+                  if (g_cfg.espDist > 0 && g_pl[i].dist 
